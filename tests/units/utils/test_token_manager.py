@@ -1,0 +1,1132 @@
+"""Unit tests for TokenManager implementations."""
+
+import asyncio
+import functools
+import pickle
+import time
+from collections.abc import Callable, Generator
+from contextlib import asynccontextmanager
+from typing import cast
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+from redis.asyncio.client import PubSub
+
+from reflex import config
+from reflex.app import EventNamespace
+from reflex.istate.data import RouterData
+from reflex.state import StateUpdate
+from reflex.utils.tasks import ensure_task
+from reflex.utils.token_manager import (
+    LocalTokenManager,
+    RedisTokenManager,
+    SocketRecord,
+    TokenManager,
+)
+from tests.units.mock_redis import mock_redis
+
+
+class TestTokenManager:
+    """Tests for the TokenManager factory."""
+
+    @patch("reflex.utils.token_manager.prerequisites.check_redis_used")
+    @patch("reflex.utils.token_manager.prerequisites.get_redis")
+    def test_create_local_when_no_redis(self, mock_get_redis, mock_check_redis_used):
+        """Test factory creates LocalTokenManager when Redis is not available.
+
+        Args:
+            mock_get_redis: Mock for prerequisites.get_redis.
+            mock_check_redis_used: Mock for prerequisites.check_redis_used.
+        """
+        mock_check_redis_used.return_value = False
+
+        manager = TokenManager.create()
+
+        assert isinstance(manager, LocalTokenManager)
+        mock_get_redis.assert_not_called()
+
+    @patch("reflex.utils.token_manager.prerequisites.check_redis_used")
+    @patch("reflex.utils.token_manager.prerequisites.get_redis")
+    def test_create_local_when_redis_client_none(
+        self, mock_get_redis, mock_check_redis_used
+    ):
+        """Test factory creates LocalTokenManager when Redis client is None.
+
+        Args:
+            mock_get_redis: Mock for prerequisites.get_redis.
+            mock_check_redis_used: Mock for prerequisites.check_redis_used.
+        """
+        mock_check_redis_used.return_value = True
+        mock_get_redis.return_value = None
+
+        manager = TokenManager.create()
+
+        assert isinstance(manager, LocalTokenManager)
+
+    @patch("reflex.utils.token_manager.prerequisites.check_redis_used")
+    @patch("reflex.utils.token_manager.prerequisites.get_redis")
+    def test_create_redis_when_redis_available(
+        self, mock_get_redis, mock_check_redis_used
+    ):
+        """Test factory creates RedisTokenManager when Redis is available.
+
+        Args:
+            mock_get_redis: Mock for prerequisites.get_redis.
+            mock_check_redis_used: Mock for prerequisites.check_redis_used.
+        """
+        mock_check_redis_used.return_value = True
+        mock_redis_client = Mock()
+        mock_redis_client.get_connection_kwargs.return_value = {"db": 0}
+        mock_get_redis.return_value = mock_redis_client
+
+        manager = TokenManager.create()
+
+        assert isinstance(manager, RedisTokenManager)
+        assert manager.redis is mock_redis_client
+
+
+class TestLocalTokenManager:
+    """Tests for LocalTokenManager."""
+
+    @pytest.fixture
+    def manager(self):
+        """Create a LocalTokenManager instance.
+
+        Returns:
+            A LocalTokenManager instance for testing.
+        """
+        return LocalTokenManager()
+
+    @pytest.mark.parametrize(
+        ("token", "sid"),
+        [
+            ("token1", "sid1"),
+            ("test-token", "test-sid"),
+            ("12345", "67890"),
+        ],
+    )
+    async def test_link_token_to_sid_normal_case(self, manager, token, sid):
+        """Test normal token linking returns None.
+
+        Args:
+            manager: LocalTokenManager fixture instance.
+            token: Token string to test.
+            sid: Session ID string to test.
+        """
+        result = await manager.link_token_to_sid(token, sid)
+
+        assert result is None
+        assert manager.token_to_sid[token] == sid
+        assert manager.sid_to_token[sid] == token
+
+    async def test_link_token_to_sid_same_token_same_sid(self, manager):
+        """Test linking same token to same SID (reconnection).
+
+        Args:
+            manager: LocalTokenManager fixture instance.
+        """
+        token, sid = "token1", "sid1"
+
+        await manager.link_token_to_sid(token, sid)
+        result = await manager.link_token_to_sid(token, sid)
+
+        assert result is None
+        assert manager.token_to_sid[token] == sid
+        assert manager.sid_to_token[sid] == token
+
+    async def test_link_token_to_sid_duplicate_token_different_sid(self, manager):
+        """Test duplicate token detection generates new token.
+
+        Args:
+            manager: LocalTokenManager fixture instance.
+        """
+        token = "duplicate_token"
+        sid1, sid2 = "sid1", "sid2"
+
+        # First connection
+        result1 = await manager.link_token_to_sid(token, sid1)
+        assert result1 is None
+
+        # Duplicate token with different SID
+        result2 = await manager.link_token_to_sid(token, sid2)
+        assert result2 is not None
+        assert result2 != token
+
+        # Check mappings
+        assert manager.token_to_sid[result2] == sid2
+        assert manager.sid_to_token[sid2] == result2
+        assert manager.token_to_sid[token] == sid1
+
+    @pytest.mark.parametrize(
+        ("token", "sid"),
+        [
+            ("token1", "sid1"),
+            ("test-token", "test-sid"),
+        ],
+    )
+    async def test_disconnect_token(self, manager, token, sid):
+        """Test token disconnection cleans up mappings.
+
+        Args:
+            manager: LocalTokenManager fixture instance.
+            token: Token string to test.
+            sid: Session ID string to test.
+        """
+        await manager.link_token_to_sid(token, sid)
+
+        await manager.disconnect_token(token, sid)
+
+        assert token not in manager.token_to_sid
+        assert sid not in manager.sid_to_token
+
+    async def test_disconnect_nonexistent_token(self, manager):
+        """Test disconnecting nonexistent token doesn't raise error.
+
+        Args:
+            manager: LocalTokenManager fixture instance.
+        """
+        await manager.disconnect_token("nonexistent", "nonexistent")
+
+        assert len(manager.token_to_sid) == 0
+        assert len(manager.sid_to_token) == 0
+
+    async def test_enumerate_tokens(self, manager):
+        """Test enumerate_tokens yields all linked tokens.
+
+        Args:
+            manager: LocalTokenManager fixture instance.
+        """
+        tokens_sids = [("token1", "sid1"), ("token2", "sid2"), ("token3", "sid3")]
+
+        for token, sid in tokens_sids:
+            await manager.link_token_to_sid(token, sid)
+
+        found_tokens = set()
+        async for token in manager.enumerate_tokens():
+            found_tokens.add(token)
+
+        expected_tokens = {token for token, _ in tokens_sids}
+        assert found_tokens == expected_tokens
+
+        # Disconnect a token and ensure it's removed.
+        await manager.disconnect_token("token2", "sid2")
+        expected_tokens.remove("token2")
+
+        found_tokens = set()
+        async for token in manager.enumerate_tokens():
+            found_tokens.add(token)
+
+        assert found_tokens == expected_tokens
+
+        # Disconnect all tokens, none should remain
+        await manager.disconnect_all()
+        found_tokens = set()
+        async for token in manager.enumerate_tokens():
+            found_tokens.add(token)
+        assert not found_tokens
+
+
+class TestRedisTokenManager:
+    """Tests for RedisTokenManager."""
+
+    @pytest.fixture
+    def mock_redis(self):
+        """Create a mock Redis client.
+
+        Returns:
+            AsyncMock configured as Redis client for testing.
+        """
+        redis = AsyncMock()
+        redis.exists = AsyncMock()
+        redis.set = AsyncMock()
+        redis.delete = AsyncMock()
+
+        # Non-async call
+        redis.get_connection_kwargs = Mock(return_value={"db": 0})
+
+        # Mock out pubsub
+        async def listen():
+            await asyncio.sleep(1)
+            if False:
+                yield
+            return
+
+        @asynccontextmanager
+        async def pubsub():
+            pubsub_mock = AsyncMock()
+            pubsub_mock.listen = listen
+            yield pubsub_mock
+
+        redis.pubsub = pubsub
+        return redis
+
+    @pytest.fixture
+    def manager(self, mock_redis):
+        """Create a RedisTokenManager instance with mocked config.
+
+        Args:
+            mock_redis: Mock Redis client fixture.
+
+        Returns:
+            RedisTokenManager instance for testing.
+        """
+        with patch("reflex_base.config.get_config") as mock_get_config:
+            mock_config = Mock()
+            mock_config.redis_token_expiration = 3600
+            mock_get_config.return_value = mock_config
+
+            return RedisTokenManager(mock_redis)
+
+    def test_get_redis_key(self, manager):
+        """Test Redis key generation follows expected pattern.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+        """
+        token = "test_token_123"
+        expected_key = f"token_manager_socket_record_{token}"
+
+        assert manager._get_redis_key(token) == expected_key
+
+    async def test_link_token_to_sid_normal_case(self, manager, mock_redis):
+        """Test normal token linking stores in both Redis and local dicts.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+            mock_redis: Mock Redis client fixture.
+        """
+        token, sid = "token1", "sid1"
+        mock_redis.exists.return_value = False
+
+        result = await manager.link_token_to_sid(token, sid)
+
+        assert result is None
+        mock_redis.exists.assert_called_once_with(
+            f"token_manager_socket_record_{token}"
+        )
+        mock_redis.set.assert_called_once_with(
+            f"token_manager_socket_record_{token}",
+            pickle.dumps(SocketRecord(instance_id=manager.instance_id, sid=sid)),
+            ex=3600,
+            nx=False,
+        )
+        assert manager.token_to_socket[token].sid == sid
+        assert manager.sid_to_token[sid] == token
+
+    async def test_link_token_to_sid_reconnection_skips_redis(
+        self, manager, mock_redis
+    ):
+        """Test reconnection with same token/SID skips Redis check.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+            mock_redis: Mock Redis client fixture.
+        """
+        token, sid = "token1", "sid1"
+        manager.token_to_socket[token] = SocketRecord(
+            instance_id=manager.instance_id, sid=sid
+        )
+
+        result = await manager.link_token_to_sid(token, sid)
+
+        assert result is None
+        mock_redis.exists.assert_not_called()
+        mock_redis.set.assert_not_called()
+
+    async def test_link_token_to_sid_duplicate_detected(self, manager, mock_redis):
+        """Test duplicate token detection generates new token.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+            mock_redis: Mock Redis client fixture.
+        """
+        token, sid = "token1", "sid1"
+        mock_redis.exists.return_value = True
+
+        result = await manager.link_token_to_sid(token, sid)
+
+        assert result is not None
+        assert result != token
+        assert len(result) == 36  # UUID4 length
+
+        mock_redis.exists.assert_called_once_with(
+            f"token_manager_socket_record_{token}"
+        )
+        mock_redis.set.assert_called_once_with(
+            f"token_manager_socket_record_{result}",
+            pickle.dumps(SocketRecord(instance_id=manager.instance_id, sid=sid)),
+            ex=3600,
+            nx=False,
+        )
+        assert manager.token_to_sid[result] == sid
+        assert manager.sid_to_token[sid] == result
+
+    async def test_link_token_to_sid_redis_error_fallback(self, manager, mock_redis):
+        """Test Redis error falls back to local manager behavior.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+            mock_redis: Mock Redis client fixture.
+        """
+        token, sid = "token1", "sid1"
+        mock_redis.exists.side_effect = Exception("Redis connection error")
+
+        with patch.object(
+            LocalTokenManager, "link_token_to_sid", new_callable=AsyncMock
+        ) as mock_super:
+            mock_super.return_value = None
+
+            result = await manager.link_token_to_sid(token, sid)
+
+            assert result is None
+            mock_super.assert_called_once_with(token, sid)
+
+    async def test_link_token_to_sid_redis_set_error_continues(
+        self, manager, mock_redis
+    ):
+        """Test Redis set error doesn't prevent local storage.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+            mock_redis: Mock Redis client fixture.
+        """
+        token, sid = "token1", "sid1"
+        mock_redis.exists.return_value = False
+        mock_redis.set.side_effect = Exception("Redis set error")
+
+        result = await manager.link_token_to_sid(token, sid)
+
+        assert result is None
+        assert manager.token_to_sid[token] == sid
+        assert manager.sid_to_token[sid] == token
+
+    async def test_disconnect_token_owned_locally(self, manager, mock_redis):
+        """Test disconnect cleans up both Redis and local mappings when owned locally.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+            mock_redis: Mock Redis client fixture.
+        """
+        token, sid = "token1", "sid1"
+        manager.token_to_socket[token] = SocketRecord(
+            instance_id=manager.instance_id, sid=sid
+        )
+        manager.sid_to_token[sid] = token
+
+        await manager.disconnect_token(token, sid)
+
+        mock_redis.delete.assert_called_once_with(
+            f"token_manager_socket_record_{token}"
+        )
+        assert token not in manager.token_to_sid
+        assert sid not in manager.sid_to_token
+
+    async def test_disconnect_token_not_owned_locally(self, manager, mock_redis):
+        """Test disconnect doesn't clean up when not owned locally.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+            mock_redis: Mock Redis client fixture.
+        """
+        token, sid = "token1", "sid1"
+
+        await manager.disconnect_token(token, sid)
+
+        mock_redis.delete.assert_not_called()
+
+    async def test_disconnect_token_clears_local_before_redis_delete(
+        self, manager, mock_redis
+    ):
+        """Local mappings are dropped before the redis delete round-trip starts."""
+        token, sid = "token1", "sid1"
+        manager.token_to_socket[token] = SocketRecord(
+            instance_id=manager.instance_id, sid=sid
+        )
+        manager.sid_to_token[sid] = token
+
+        cached_at_delete = {}
+
+        def delete(key):
+            cached_at_delete["token"] = token in manager.token_to_socket
+            cached_at_delete["sid"] = sid in manager.sid_to_token
+
+        mock_redis.delete.side_effect = delete
+
+        await manager.disconnect_token(token, sid)
+
+        mock_redis.delete.assert_called_once_with(
+            f"token_manager_socket_record_{token}"
+        )
+        assert cached_at_delete == {"token": False, "sid": False}
+
+    async def test_is_token_connected_ignores_stale_own_record(
+        self, manager, mock_redis
+    ):
+        """A redis record claiming this instance without a live local link is stale."""
+        stale = SocketRecord(instance_id=manager.instance_id, sid="sid1")
+        mock_redis.get = AsyncMock(return_value=pickle.dumps(stale))
+
+        assert not await manager.is_token_connected("token1")
+        assert "token1" not in manager.token_to_socket
+        assert "sid1" not in manager.sid_to_token
+
+    async def test_fetch_socket_record_own_record_with_live_link(
+        self, manager, mock_redis
+    ):
+        """A redis record claiming this instance with a live local link is cached."""
+        record = SocketRecord(instance_id=manager.instance_id, sid="sid1")
+        manager.sid_to_token["sid1"] = "token1"
+        mock_redis.get = AsyncMock(return_value=pickle.dumps(record))
+
+        assert await manager._fetch_socket_record("token1") == record
+        assert manager.token_to_socket["token1"] == record
+
+    async def test_socket_record_del_keeps_live_local_mapping(
+        self, manager, mock_redis
+    ):
+        """A late redis del notification must not drop a live local mapping."""
+        token, sid = "token1", "sid2"
+        record = SocketRecord(instance_id=manager.instance_id, sid=sid)
+        manager.token_to_socket[token] = record
+        manager.sid_to_token[sid] = token
+
+        await manager._handle_socket_record_del(token)
+
+        assert manager.token_to_socket[token] == record
+        assert manager.sid_to_token[sid] == token
+        mock_redis.set.assert_called_once_with(
+            f"token_manager_socket_record_{token}",
+            pickle.dumps(record),
+            ex=3600,
+            nx=True,
+        )
+
+    async def test_socket_record_del_adopts_newer_record_when_restore_loses(
+        self, manager, mock_redis
+    ):
+        """A rejected NX restore adopts the newer redis record immediately."""
+        token, sid = "token1", "sid1"
+        stale = SocketRecord(instance_id=manager.instance_id, sid=sid)
+        manager.token_to_socket[token] = stale
+        manager.sid_to_token[sid] = token
+        newer = SocketRecord(instance_id="other-instance", sid="sid2")
+        mock_redis.set.return_value = None
+        mock_redis.get = AsyncMock(return_value=pickle.dumps(newer))
+
+        await manager._handle_socket_record_del(token)
+
+        assert manager.token_to_socket[token] == newer
+        assert manager.sid_to_token["sid2"] == token
+        assert sid not in manager.sid_to_token
+
+    async def test_socket_record_del_drops_foreign_cache(self, manager, mock_redis):
+        """A del notification drops a cached foreign record."""
+        manager.token_to_socket["token1"] = SocketRecord(
+            instance_id="other-instance", sid="sid9"
+        )
+
+        await manager._handle_socket_record_del("token1")
+
+        assert "token1" not in manager.token_to_socket
+        mock_redis.set.assert_not_called()
+
+    async def test_is_token_connected_after_late_disconnect_notification(
+        self, manager, mock_redis
+    ):
+        """A late del notification for a relinked token must not break delivery."""
+        token = "token1"
+        mock_redis.exists.return_value = False
+        await manager.link_token_to_sid(token, "sid1")
+        # Old socket disconnects; the client relinks before the notification arrives.
+        await manager.disconnect_token(token, "sid1")
+        await manager.link_token_to_sid(token, "sid2")
+        # The keyspace notification for the old delete arrives late.
+        await manager._handle_socket_record_del(token)
+
+        record = manager.token_to_socket.get(token)
+        mock_redis.get = AsyncMock(
+            return_value=pickle.dumps(record) if record else None
+        )
+        assert await manager.is_token_connected(token)
+
+    async def test_disconnect_token_redis_error(self, manager, mock_redis):
+        """Test disconnect continues with local cleanup even if Redis fails.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+            mock_redis: Mock Redis client fixture.
+        """
+        token, sid = "token1", "sid1"
+        manager.token_to_socket[token] = SocketRecord(
+            instance_id=manager.instance_id, sid=sid
+        )
+        manager.sid_to_token[sid] = token
+        mock_redis.delete.side_effect = Exception("Redis delete error")
+
+        await manager.disconnect_token(token, sid)
+
+        assert token not in manager.token_to_sid
+        assert sid not in manager.sid_to_token
+
+    @pytest.mark.parametrize(
+        "redis_error",
+        [
+            Exception("Connection timeout"),
+            Exception("Redis server down"),
+            Exception("Network error"),
+        ],
+    )
+    async def test_various_redis_errors_handled_gracefully(
+        self, manager, mock_redis, redis_error
+    ):
+        """Test various Redis errors are handled gracefully.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+            mock_redis: Mock Redis client fixture.
+            redis_error: Exception to test error handling.
+        """
+        token, sid = "token1", "sid1"
+        mock_redis.exists.side_effect = redis_error
+
+        with patch.object(
+            LocalTokenManager, "link_token_to_sid", new_callable=AsyncMock
+        ) as mock_super:
+            mock_super.return_value = None
+
+            result = await manager.link_token_to_sid(token, sid)
+
+            assert result is None
+            mock_super.assert_called_once()
+
+    async def test_is_token_connected_locally_owned(self, manager, mock_redis):
+        """A locally owned socket record is authoritative, without a redis lookup."""
+        manager.token_to_socket["token1"] = SocketRecord(
+            instance_id=manager.instance_id, sid="sid1"
+        )
+
+        assert await manager.is_token_connected("token1")
+        mock_redis.get.assert_not_called()
+
+    async def test_is_token_connected_stale_foreign_record(self, manager, mock_redis):
+        """A cached foreign record is refreshed from redis and dropped when gone."""
+        manager.token_to_socket["token1"] = SocketRecord(
+            instance_id="other-instance", sid="sid1"
+        )
+        manager.sid_to_token["sid1"] = "token1"
+        mock_redis.get = AsyncMock(return_value=None)
+
+        assert not await manager.is_token_connected("token1")
+        assert "token1" not in manager.token_to_socket
+        assert "sid1" not in manager.sid_to_token
+
+    async def test_is_token_connected_foreign_record_moved(self, manager, mock_redis):
+        """A cached foreign record and its sid mapping are replaced on a move."""
+        manager.token_to_socket["token1"] = SocketRecord(
+            instance_id="old-instance", sid="sid1"
+        )
+        manager.sid_to_token["sid1"] = "token1"
+        new_record = SocketRecord(instance_id="new-instance", sid="sid2")
+        mock_redis.get = AsyncMock(return_value=pickle.dumps(new_record))
+
+        assert await manager.is_token_connected("token1")
+        assert manager.token_to_socket["token1"] == new_record
+        assert "sid1" not in manager.sid_to_token
+        assert manager.sid_to_token["sid2"] == "token1"
+
+    async def test_is_token_connected_redis_error_trusts_cache(
+        self, manager, mock_redis
+    ):
+        """A redis failure preserves and trusts the cached foreign record."""
+        record = SocketRecord(instance_id="other-instance", sid="sid1")
+        manager.token_to_socket["token1"] = record
+        manager.sid_to_token["sid1"] = "token1"
+        mock_redis.get = AsyncMock(side_effect=Exception("Redis down"))
+
+        assert await manager.is_token_connected("token1")
+        assert not await manager.is_token_connected("unknown-token")
+        assert manager.token_to_socket["token1"] == record
+        assert manager.sid_to_token["sid1"] == "token1"
+
+    def test_inheritance_from_local_manager(self, manager):
+        """Test RedisTokenManager inherits from LocalTokenManager.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+        """
+        assert isinstance(manager, LocalTokenManager)
+        assert hasattr(manager, "token_to_sid")
+        assert hasattr(manager, "sid_to_token")
+
+    async def test_close_cancels_tasks_and_closes_redis(self, manager, mock_redis):
+        """Test close cancels background pub/sub tasks and closes the Redis client.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+            mock_redis: Mock Redis client fixture.
+        """
+        manager._ensure_socket_record_task()
+        task = manager._socket_record_task
+        assert task is not None
+
+        await manager.close()
+
+        assert task.cancelled()
+        assert manager._socket_record_task is None
+        assert manager._lost_and_found_task is None
+        mock_redis.aclose.assert_awaited_once()
+
+    async def test_close_without_tasks(self, manager, mock_redis):
+        """Test close works when no background tasks were started.
+
+        Args:
+            manager: RedisTokenManager fixture instance.
+            mock_redis: Mock Redis client fixture.
+        """
+        await manager.close()
+
+        mock_redis.aclose.assert_awaited_once()
+
+
+async def test_socket_record_subscriber_restores_deleted_live_record():
+    """The keyspace subscriber restores a deleted record of a live local socket."""
+    redis = mock_redis()
+    manager = RedisTokenManager(redis)
+    token, sid = "token1", "sid1"
+    key = manager._get_redis_key(token)
+    record = manager.token_to_socket[token] = SocketRecord(
+        instance_id=manager.instance_id, sid=sid
+    )
+    manager.sid_to_token[sid] = token
+    await manager._store_socket_record(token, record)
+    event_log = redis._internals["event_log"]  # pyright: ignore[reportAttributeAccessIssue]
+    on_update = redis._internals["event_log_on_update"]  # pyright: ignore[reportAttributeAccessIssue]
+
+    async def logged(channel: bytes, data: bytes, start: int = 0):
+        """Wait until the mock redis logs an event.
+
+        Args:
+            channel: The channel of the event.
+            data: The data of the event.
+            start: The event log index to search from.
+        """
+        while {"channel": channel, "data": data} not in event_log[start:]:
+            on_update.clear()
+            await on_update.wait()
+
+    manager._ensure_socket_record_task()
+    try:
+        await asyncio.wait_for(
+            logged(
+                b"psubscribe", f"__keyspace@1__:{manager._get_redis_key('*')}".encode()
+            ),
+            timeout=1,
+        )
+        start = len(event_log)
+        await redis.delete(key)
+        # Shorter than the subscriber's retry delay, so a crashed listen fails.
+        await asyncio.wait_for(
+            logged(f"__keyspace@1__:{key}".encode(), b"set", start), timeout=0.5
+        )
+    finally:
+        await manager.close()
+    assert pickle.loads(cast("bytes", await redis.get(key))) == record
+
+
+@pytest.fixture
+def redis_url():
+    """Returns the Redis URL from the environment."""
+    redis_url = config.get_config().redis_url
+    if redis_url is None:
+        pytest.skip("Redis URL not configured")
+    return redis_url
+
+
+def query_string_for(token: str) -> dict[str, str]:
+    """Generate query string for given token.
+
+    Args:
+        token: The token to generate query string for.
+
+    Returns:
+        The generated query string.
+    """
+    return {"QUERY_STRING": f"token={token}"}
+
+
+@pytest.fixture
+def event_namespace_factory() -> Generator[Callable[[], EventNamespace], None, None]:
+    """Yields the EventNamespace factory function."""
+    namespace = config.get_config().get_event_namespace()
+    created_objs = []
+
+    def new_event_namespace() -> EventNamespace:
+        state = Mock()
+        state.router_data = {}
+
+        mock_app = Mock()
+        mock_app.state_manager.modify_state = Mock(
+            return_value=AsyncMock(__aenter__=AsyncMock(return_value=state))
+        )
+
+        event_namespace = EventNamespace(namespace=namespace, app=mock_app)
+        event_namespace.emit = AsyncMock()
+        created_objs.append(event_namespace)
+        return event_namespace
+
+    yield new_event_namespace
+
+    for obj in created_objs:
+        asyncio.run(obj._token_manager.disconnect_all())
+
+
+@pytest.mark.usefixtures("redis_url")
+@pytest.mark.asyncio
+async def test_redis_token_manager_enumerate_tokens(
+    event_namespace_factory: Callable[[], EventNamespace],
+):
+    """Integration test for RedisTokenManager enumerate_tokens interface.
+
+    Should support enumerating tokens across separate instances of the
+    RedisTokenManager.
+
+    Args:
+        event_namespace_factory: Factory fixture for EventNamespace instances.
+    """
+    event_namespace1 = event_namespace_factory()
+    event_namespace2 = event_namespace_factory()
+
+    await event_namespace1.on_connect(sid="sid1", environ=query_string_for("token1"))
+    await event_namespace2.on_connect(sid="sid2", environ=query_string_for("token2"))
+
+    found_tokens = set()
+    async for token in event_namespace1._token_manager.enumerate_tokens():
+        found_tokens.add(token)
+
+    assert "token1" in found_tokens
+    assert "token2" in found_tokens
+    assert len(found_tokens) == 2
+
+    await event_namespace1._token_manager.disconnect_all()
+
+    found_tokens = set()
+    async for token in event_namespace1._token_manager.enumerate_tokens():
+        found_tokens.add(token)
+    assert "token2" in found_tokens
+    assert len(found_tokens) == 1
+
+    await event_namespace2._token_manager.disconnect_all()
+
+    found_tokens = set()
+    async for token in event_namespace1._token_manager.enumerate_tokens():
+        found_tokens.add(token)
+    assert not found_tokens
+
+
+@pytest.mark.usefixtures("redis_url")
+@pytest.mark.asyncio
+async def test_redis_token_manager_get_token_owner(
+    event_namespace_factory: Callable[[], EventNamespace],
+):
+    """Integration test for RedisTokenManager get_token_owner interface.
+
+    Should support retrieving the owner of a token across separate instances of the
+    RedisTokenManager.
+
+    Args:
+        event_namespace_factory: Factory fixture for EventNamespace instances.
+    """
+    event_namespace1 = event_namespace_factory()
+    event_namespace2 = event_namespace_factory()
+
+    await event_namespace1.on_connect(sid="sid1", environ=query_string_for("token1"))
+    await event_namespace2.on_connect(sid="sid2", environ=query_string_for("token2"))
+
+    assert isinstance((manager1 := event_namespace1._token_manager), RedisTokenManager)
+    assert isinstance((manager2 := event_namespace2._token_manager), RedisTokenManager)
+
+    assert await manager1._get_token_owner("token1") == manager1.instance_id
+    assert await manager1._get_token_owner("token2") == manager2.instance_id
+    assert await manager2._get_token_owner("token1") == manager1.instance_id
+    assert await manager2._get_token_owner("token2") == manager2.instance_id
+
+
+async def _wait_for_call_count_positive(mock: Mock, timeout: float = 5.0):
+    """Wait until the mock's call count is positive.
+
+    Args:
+        mock: The mock to wait on.
+        timeout: The maximum time to wait in seconds.
+    """
+    deadline = time.monotonic() + timeout
+    while mock.call_count == 0 and time.monotonic() < deadline:  # noqa: ASYNC110
+        await asyncio.sleep(0.1)
+
+
+@pytest.mark.usefixtures("redis_url")
+@pytest.mark.asyncio
+async def test_redis_token_manager_restore_does_not_clobber_new_owner(
+    event_namespace_factory: Callable[[], EventNamespace],
+):
+    """A late keep-alive restore must not overwrite another instance's record.
+
+    Args:
+        event_namespace_factory: Factory fixture for EventNamespace instances.
+    """
+    event_namespace1 = event_namespace_factory()
+    event_namespace2 = event_namespace_factory()
+
+    manager1 = event_namespace1._token_manager
+    manager2 = event_namespace2._token_manager
+    assert isinstance(manager1, RedisTokenManager)
+    assert isinstance(manager2, RedisTokenManager)
+
+    await event_namespace1.on_connect(sid="sid1", environ=query_string_for("token1"))
+    # Stop the live subscriber so the deletion notification is handled manually.
+    assert manager1._socket_record_task is not None
+    manager1._socket_record_task.cancel()
+    # The record expires and another instance claims the token.
+    await manager1.redis.delete(manager1._get_redis_key("token1"))
+    await event_namespace2.on_connect(sid="sid2", environ=query_string_for("token1"))
+    # The first instance processes the expiration notification late.
+    await manager1._handle_socket_record_del("token1")
+
+    assert await manager2._get_token_owner("token1", refresh=True) == (
+        manager2.instance_id
+    )
+    # The losing restore adopted the newer record locally.
+    assert manager1.token_to_socket["token1"].instance_id == manager2.instance_id
+
+
+@pytest.mark.usefixtures("redis_url")
+@pytest.mark.asyncio
+async def test_redis_token_manager_lost_and_found(
+    event_namespace_factory: Callable[[], EventNamespace],
+):
+    """Updates emitted for lost and found tokens should be routed correctly via redis.
+
+    Args:
+        event_namespace_factory: Factory fixture for EventNamespace instances.
+    """
+    event_namespace1 = event_namespace_factory()
+    emit1_mock: Mock = event_namespace1.emit  # pyright: ignore[reportAssignmentType]
+    event_namespace2 = event_namespace_factory()
+    emit2_mock: Mock = event_namespace2.emit  # pyright: ignore[reportAssignmentType]
+
+    await event_namespace1.on_connect(sid="sid1", environ=query_string_for("token1"))
+    await event_namespace2.on_connect(sid="sid2", environ=query_string_for("token2"))
+
+    await event_namespace2.emit_update(StateUpdate(), token="token1")
+    await _wait_for_call_count_positive(emit1_mock)
+    emit2_mock.assert_not_called()
+    emit1_mock.assert_called_once()
+    emit1_mock.reset_mock()
+
+    await event_namespace2.emit_update(StateUpdate(), token="token2")
+    await _wait_for_call_count_positive(emit2_mock)
+    emit1_mock.assert_not_called()
+    emit2_mock.assert_called_once()
+    emit2_mock.reset_mock()
+
+    if task := event_namespace1.on_disconnect(sid="sid1"):
+        await task
+    await event_namespace2.emit_update(StateUpdate(), token="token1")
+    # Update should be dropped on the floor.
+    await asyncio.sleep(2)
+    emit1_mock.assert_not_called()
+    emit2_mock.assert_not_called()
+
+    await event_namespace2.on_connect(sid="sid1", environ=query_string_for("token1"))
+    await event_namespace2.emit_update(StateUpdate(), token="token1")
+    await _wait_for_call_count_positive(emit2_mock)
+    emit1_mock.assert_not_called()
+    emit2_mock.assert_called_once()
+    emit2_mock.reset_mock()
+
+    if task := event_namespace2.on_disconnect(sid="sid1"):
+        await task
+    await event_namespace1.on_connect(sid="sid1", environ=query_string_for("token1"))
+    await event_namespace2.emit_update(StateUpdate(), token="token1")
+    await _wait_for_call_count_positive(emit1_mock)
+    emit2_mock.assert_not_called()
+    emit1_mock.assert_called_once()
+    emit1_mock.reset_mock()
+
+
+@pytest.mark.asyncio
+async def test_redis_token_manager_waits_for_an_unconfirmed_subscription_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Connects stop waiting once redis has had its time to confirm the subscription.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        caplog: The pytest log capture fixture.
+    """
+
+    async def listen():
+        """Never confirm the subscription."""
+        await asyncio.Event().wait()
+        if False:
+            yield
+
+    @asynccontextmanager
+    async def pubsub():
+        yield Mock(psubscribe=AsyncMock(), listen=listen)
+
+    monkeypatch.setattr(
+        "reflex.utils.token_manager.LOST_AND_FOUND_SUBSCRIBE_TIMEOUT", 0.05
+    )
+    manager = RedisTokenManager(Mock(pubsub=pubsub, aclose=AsyncMock()))
+    try:
+        await manager.ensure_lost_and_found_subscribed(AsyncMock())
+        started = time.monotonic()
+        await manager.ensure_lost_and_found_subscribed(AsyncMock())
+        assert time.monotonic() - started < 0.05
+
+        assert manager._lost_and_found_task is not None
+        assert not manager._lost_and_found_task.done()
+        assert [record.getMessage() for record in caplog.records] == [
+            (
+                "Redis did not confirm the lost and found subscription in time; "
+                "updates from other instances may be lost until it does."
+            )
+        ]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_redis_token_manager_waits_again_while_resubscribing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """A subscriber that fails and subscribes again makes connects wait again.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        caplog: The pytest log capture fixture.
+    """
+    fail = asyncio.Event()
+    attempts = 0
+
+    async def listen():
+        """Confirm and then fail the first subscription, never confirm the next.
+
+        Yields:
+            The confirmation of the first subscription.
+
+        Raises:
+            ConnectionError: When the first subscription fails.
+        """
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            yield {"type": "psubscribe"}
+            await fail.wait()
+            msg = "connection lost"
+            raise ConnectionError(msg)
+        await asyncio.Event().wait()
+
+    @asynccontextmanager
+    async def pubsub():
+        yield Mock(psubscribe=AsyncMock(), listen=listen)
+
+    monkeypatch.setattr(
+        "reflex.utils.token_manager.LOST_AND_FOUND_SUBSCRIBE_TIMEOUT", 0.05
+    )
+    # Retry the failed subscription at once instead of after a second.
+    monkeypatch.setattr(
+        "reflex.utils.token_manager.ensure_task",
+        functools.partial(ensure_task, exception_delay=0),
+    )
+    manager = RedisTokenManager(Mock(pubsub=pubsub, aclose=AsyncMock()))
+    try:
+        await manager.ensure_lost_and_found_subscribed(AsyncMock())
+        # Outlast the first subscription's wait before it fails.
+        await asyncio.sleep(0.1)
+        fail.set()
+        while attempts < 2:  # noqa: ASYNC110
+            await asyncio.sleep(0)
+
+        await manager.ensure_lost_and_found_subscribed(AsyncMock())
+
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "reflex.utils.token_manager"
+        ] == [
+            (
+                "Redis did not confirm the lost and found subscription in time; "
+                "updates from other instances may be lost until it does."
+            )
+        ]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.usefixtures("redis_url")
+@pytest.mark.asyncio
+async def test_redis_token_manager_lost_and_found_subscribes_before_connecting(
+    event_namespace_factory: Callable[[], EventNamespace],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A connect waits for the lost and found subscription, so no update is lost.
+
+    Redis drops a message published before its subscriber is subscribed, and
+    the socket record tells other instances to publish as soon as it is stored.
+
+    Args:
+        event_namespace_factory: Factory fixture for EventNamespace instances.
+        monkeypatch: The pytest monkeypatch fixture.
+    """
+    psubscribe = PubSub.psubscribe
+
+    async def slow_psubscribe(self: PubSub, *args, **kwargs):
+        if any("lost_and_found" in str(arg) for arg in args):
+            await asyncio.sleep(0.5)
+        return await psubscribe(self, *args, **kwargs)
+
+    monkeypatch.setattr(PubSub, "psubscribe", slow_psubscribe)
+    event_namespace1 = event_namespace_factory()
+    emit1_mock: Mock = event_namespace1.emit  # pyright: ignore[reportAssignmentType]
+    event_namespace2 = event_namespace_factory()
+
+    await event_namespace1.on_connect(sid="sid1", environ=query_string_for("token1"))
+    await event_namespace2.emit_update(StateUpdate(), token="token1")
+    await _wait_for_call_count_positive(emit1_mock)
+
+    emit1_mock.assert_called_once()
+
+
+@pytest.mark.usefixtures("redis_url")
+@pytest.mark.asyncio
+async def test_redis_token_manager_lost_and_found_router_data(
+    event_namespace_factory: Callable[[], EventNamespace],
+):
+    """Updates emitted for lost and found tokens should serialize properly.
+
+    Args:
+        event_namespace_factory: Factory fixture for EventNamespace instances.
+    """
+    event_namespace1 = event_namespace_factory()
+    emit1_mock: Mock = event_namespace1.emit  # pyright: ignore[reportAssignmentType]
+    event_namespace2 = event_namespace_factory()
+    emit2_mock: Mock = event_namespace2.emit  # pyright: ignore[reportAssignmentType]
+
+    await event_namespace1.on_connect(sid="sid1", environ=query_string_for("token1"))
+    await event_namespace2.on_connect(sid="sid2", environ=query_string_for("token2"))
+
+    router = RouterData.from_router_data(
+        {"headers": {"x-test": "value"}},
+    )
+
+    await event_namespace2.emit_update(
+        StateUpdate(delta={"state": {"router": router}}), token="token1"
+    )
+    await _wait_for_call_count_positive(emit1_mock)
+    emit2_mock.assert_not_called()
+    emit1_mock.assert_called_once()
+    assert isinstance(emit1_mock.call_args[0][1], StateUpdate)
+    assert isinstance(emit1_mock.call_args[0][1].delta["state"]["router"], RouterData)
+    assert emit1_mock.call_args[0][1].delta["state"]["router"] == router
+    emit1_mock.reset_mock()

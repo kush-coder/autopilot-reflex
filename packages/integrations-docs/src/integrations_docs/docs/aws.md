@@ -1,0 +1,91 @@
+---
+tags: Data Infrastructure
+description: Connect to Amazon Web Services (AWS) for cloud storage, databases, compute, AI/ML, and more.
+---
+# AWS Integration
+
+The **AWS Integration** allows your app to connect to [Amazon Web Services (AWS)](https://aws.amazon.com/) — the world's most comprehensive cloud platform. Once connected, your app can access 200+ AWS services including storage, databases, compute, AI/ML, and more using the boto3 SDK.
+
+## What You Can Do
+
+With AWS integration, your app can:
+- **S3 (Object Storage):** Upload, download, and manage files in S3 buckets. Generate presigned URLs for secure file access. Works with S3-compatible services like MinIO, Cloudflare R2, and DigitalOcean Spaces.
+- **DynamoDB (NoSQL Database):** Store and query data in a fully managed, serverless NoSQL database with single-digit millisecond performance.
+- **Lambda (Serverless Functions):** Invoke serverless functions, run code without managing servers, and build event-driven applications.
+- **SES (Email Service):** Send transactional emails, marketing emails, and notifications with high deliverability.
+- **SNS (Notifications):** Send push notifications, SMS, and email messages to users across multiple channels.
+- **SQS (Message Queues):** Build distributed, decoupled systems with reliable message queuing.
+- **Rekognition (Computer Vision):** Analyze images and videos for object detection, facial analysis, text extraction, and content moderation.
+- **Comprehend (NLP):** Extract insights from text using natural language processing for sentiment analysis, entity recognition, and topic modeling.
+- **Bedrock (AI Models):** Access foundation models from Amazon, Anthropic, Meta, Mistral AI, OpenAI, Cohere, Stability AI, and other providers for generative AI applications.
+- **And 200+ more services:** EC2, RDS, CloudWatch, Polly, Textract, Translate, and many others.
+
+## Step 1: Obtain AWS Credentials
+
+1. Log in to the [AWS Console](https://console.aws.amazon.com/).
+
+2. **Create IAM credentials:**
+   - Navigate to **IAM (Identity and Access Management)**.
+   - Click **Users** → **Create user**, or select an existing user.
+   - On the **Set permissions** step (or the existing user's **Permissions** tab), attach policies based on the AWS services you plan to use:
+     - **S3:** `AmazonS3FullAccess` or custom S3 policy
+     - **DynamoDB:** `AmazonDynamoDBFullAccess` or custom DynamoDB policy
+     - **Lambda:** `AWSLambda_FullAccess` or custom Lambda policy
+     - **SES:** `AmazonSESFullAccess` or custom SES policy
+     - **Multiple services:** Attach multiple policies or create a custom policy combining permissions
+
+   **Example custom policy for S3 + DynamoDB:**
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": "s3:ListBucket",
+         "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME"
+       },
+       {
+         "Effect": "Allow",
+         "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+         "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan"],
+         "Resource": "arn:aws:dynamodb:YOUR_REGION:YOUR_ACCOUNT_ID:table/*"
+       }
+     ]
+   }
+   ```
+
+3. **Generate access keys:**
+   - Open the user, select the **Security credentials** tab, and under **Access keys** click **Create access key**.
+   - Choose **Application running outside AWS** as the use case, click **Next**, then **Create access key**.
+   - Copy the **Access key ID** and **Secret access key** (or click **Download .csv file**). The secret is shown only once.
+
+   **Example credentials:**
+   * **Access Key ID:** `AKIAIOSFODNN7EXAMPLE`
+   * **Secret Access Key:** `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`
+
+## Step 2: Configure the Integration in Your App
+
+1. In Reflex Build, open the **Integrations** tab, select the **AWS** card, and click **Add connection**.
+2. Enter your **AWS_ACCESS_KEY_ID** and **AWS_SECRET_ACCESS_KEY**.
+3. **(Optional)** Enter your **AWS_REGION** (e.g., `us-east-1`, `eu-west-1`). Defaults to `us-east-1`.
+4. **(Optional)** Enter an **AWS_ENDPOINT_URL** if using S3-compatible services. The app runs in Reflex's cloud, so the endpoint must be reachable from the internet:
+   - **MinIO:** your MinIO server's public URL
+   - **Cloudflare R2:** `https://<account-id>.r2.cloudflarestorage.com`
+   - **DigitalOcean Spaces:** `https://<region>.digitaloceanspaces.com`
+   - Leave blank for standard AWS services.
+5. Click **Connect** to save the connection.
+
+Once connected, your app can access AWS services using boto3.
+
+## Important Notes
+
+* **IAM permissions:** Ensure your IAM user has the necessary permissions for the AWS services you plan to use. Attach service-specific policies (e.g., `AmazonS3FullAccess`, `AmazonDynamoDBFullAccess`, `AWSLambda_FullAccess`) or create custom policies with least-privilege access.
+* **AWS Region:** Most AWS services are region-specific. Set **AWS_REGION** to the region where your resources are located (e.g., S3 buckets, DynamoDB tables, Lambda functions).
+* **Cost management:** Monitor AWS usage and costs through the AWS Billing Dashboard. Set up billing alerts to avoid unexpected charges.
+* **Security:** Rotate your access keys regularly and enable MFA for AWS console access. Apply least-privilege IAM policies to limit permissions to only what's needed.
+* **S3-compatible services:** For S3 operations, this integration works with S3-compatible storage like MinIO (self-hosted), Cloudflare R2 (zero egress fees), and DigitalOcean Spaces. Just provide the custom endpoint URL in the configuration.
+* **Service availability:** Not all AWS services are available in all regions. Check the [AWS Regional Services List](https://aws.amazon.com/about-aws/global-infrastructure/regional-product-services/) for service availability.

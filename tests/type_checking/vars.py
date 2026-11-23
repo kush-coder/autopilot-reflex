@@ -1,0 +1,64 @@
+"""Inferred types for `reflex.vars` that are part of the public contract."""
+
+import dataclasses
+from typing import Any, Literal, assert_type
+
+from reflex_base.event import EventChain
+from reflex_components_core.el.elements.typography import Div
+
+from reflex.vars.base import Var
+from reflex.vars.function import FunctionStringVar, ReflexCallable
+from reflex.vars.number import (
+    BooleanVar,
+    LiteralBooleanVar,
+    LiteralNumberVar,
+    NumberVar,
+)
+from reflex.vars.object import LiteralObjectVar
+from reflex.vars.sequence import LiteralArrayVar, LiteralStringVar, StringVar
+
+# `Var.create` dispatches on the value type through a long overload set. Each of
+# these picked `LiteralBooleanVar` while `Var.bool` shadowed the builtin `bool`
+# in the `value: bool` annotation of the second overload.
+assert_type(Var.create(True), LiteralBooleanVar)
+assert_type(Var.create(1), LiteralNumberVar[int])
+assert_type(Var.create(1.5), LiteralNumberVar[float])
+assert_type(Var.create("x"), LiteralStringVar[Literal["x"]])
+assert_type(Var.create([1, 2]), LiteralArrayVar[list[int]])
+# Not asserted: `Var.create({"a": 1})`. pyright infers `LiteralObjectVar[dict[str,
+# int]]`, ty infers `dict[Unknown, int]` for the key. Only assert what every
+# checker agrees on, or this file stops being a gate for the ones that disagree.
+
+# `Var.to` selects its return type from the requested output type. The `bool`
+# overload was shadowed the same way.
+_any_var: Var[Any] = Var.create(None)
+assert_type(_any_var.to(bool), BooleanVar)
+assert_type(_any_var.to(str), StringVar[str])
+assert_type(_any_var.to(int), NumberVar[int])
+
+# `guess_type` narrows on the declared inner type via a `self` annotation, so
+# the `Var[bool]` overload is the one the `bool` shadow affected.
+_bool_var: Var[bool] = Var("expr")
+_str_var: Var[str] = Var("expr")
+assert_type(_bool_var.guess_type(), BooleanVar)
+assert_type(_str_var.guess_type(), StringVar[str])
+
+
+# `LiteralObjectVar.create` takes any value that serializes to a mapping, such
+# as a dataclass, not only a mapping.
+@dataclasses.dataclass
+class _Point:
+    x: int
+
+
+LiteralObjectVar.create(_Point(1))
+
+# A JS function typed as an event chain is bound to a trigger as its whole handler.
+_on_mount = FunctionStringVar.create("() => {}", _var_type=EventChain)
+assert_type(_on_mount, FunctionStringVar[ReflexCallable[..., Any]])
+Div.create(on_mount=_on_mount)
+# Any other `_var_type` still names the function's own signature.
+assert_type(
+    FunctionStringVar.create("(x) => x", _var_type=ReflexCallable[[int], int]),
+    FunctionStringVar[ReflexCallable[[int], int]],
+)

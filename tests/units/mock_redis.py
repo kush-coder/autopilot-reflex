@@ -1,0 +1,386 @@
+"""Mock implementation of redis for unit testing."""
+
+import asyncio
+import contextlib
+import fnmatch
+import time
+from collections.abc import AsyncGenerator, Callable
+from typing import Any
+from unittest.mock import AsyncMock, Mock
+
+from redis.asyncio import Redis
+from redis.typing import EncodableT, KeyT
+
+from reflex.istate.manager.redis import (
+    _COUNT_OTHER_CONTENDERS_SCRIPT,
+    _EXTEND_LOCK_SCRIPT,
+    _FENCED_SAVE_SCRIPT,
+    _RELEASE_LOCK_SCRIPT,
+)
+from reflex.utils import prerequisites
+
+WRONGTYPE_MESSAGE = "WRONGTYPE Operation against a key holding the wrong kind of value"
+
+
+def mock_redis() -> Redis:
+    """Mock the redis client with pubsub support.
+
+    Returns:
+        The mocked redis client.
+    """
+    keys: dict[bytes, EncodableT | set[EncodableT]] = {}
+    expire_times: dict[bytes, float] = {}
+    event_log: list[dict[str, bytes]] = []
+    event_log_new_events = asyncio.Event()
+    event_log_on_update = asyncio.Event()
+
+    def _event_log_append_notify(event: dict[str, bytes]) -> None:
+        event_log.append(event)
+        event_log_new_events.set()
+        event_log_on_update.set()
+
+    def _key_bytes(key: KeyT) -> bytes:
+        if isinstance(key, str):
+            return key.encode()
+        if isinstance(key, memoryview):
+            return key.tobytes()
+        return key
+
+    def _keyspace_event(key: KeyT, data: str | bytes):
+        if isinstance(key, str):
+            key = key.encode()
+        if isinstance(data, str):
+            data = data.encode()
+        _event_log_append_notify({"channel": b"__keyspace@1__:" + key, "data": data})
+
+    def _expire_keys():
+        to_delete = []
+        for key, expire_time in expire_times.items():
+            if expire_time <= time.monotonic():
+                to_delete.append(key)
+        for key in to_delete:
+            del keys[key]
+            del expire_times[key]
+            _keyspace_event(key, "expired")
+
+    async def mock_get(key: KeyT):  # noqa: RUF029
+        _expire_keys()
+        return keys.get(_key_bytes(key))
+
+    async def mock_mget(requested_keys: list[KeyT]):
+        """Read keys in request order, including missing values.
+
+        Args:
+            requested_keys: The keys to read.
+
+        Returns:
+            The stored values, or None for missing keys.
+        """
+        # Let concurrent tasks run, as they would during the real Redis IO.
+        await asyncio.sleep(0)
+        _expire_keys()
+        return [keys.get(_key_bytes(key)) for key in requested_keys]
+
+    async def mock_set(  # noqa: RUF029
+        key: KeyT,
+        value: EncodableT,
+        ex: int | None = None,
+        px: int | None = None,
+        nx: bool = False,
+    ) -> bool:
+        _expire_keys()
+        key = _key_bytes(key)
+        if nx and key in keys:
+            return False
+        keys[key] = value
+        _keyspace_event(key, "set")
+        if ex is not None:
+            expire_times[key] = time.monotonic() + ex
+            _keyspace_event(key, "expire")
+        elif px is not None:
+            expire_times[key] = time.monotonic() + (px / 1000)
+            _keyspace_event(key, "expire")
+        return True
+
+    async def mock_sadd(key: KeyT, value: EncodableT) -> int:  # noqa: RUF029
+        _expire_keys()
+        key = _key_bytes(key)
+        keyset = keys.setdefault(key, set())
+        if not isinstance(keyset, set):
+            raise TypeError(WRONGTYPE_MESSAGE)
+        if value in keyset:
+            return 0
+        keyset.add(value)
+        # Like redis, only announce a member that was added.
+        _keyspace_event(key, "sadd")
+        return 1
+
+    async def mock_srem(key: KeyT, value: EncodableT) -> int:
+        _expire_keys()
+        keyset = keys.get(_key_bytes(key))
+        if keyset is None:
+            return 0
+        if not isinstance(keyset, set):
+            raise TypeError(WRONGTYPE_MESSAGE)
+        if value in keyset:
+            keyset.remove(value)
+            _keyspace_event(key, "srem")
+            if not keyset:
+                await redis_mock.delete(key)
+            return 1
+        return 0
+
+    async def mock_scard(key: KeyT) -> int:  # noqa: RUF029
+        _expire_keys()
+        keyset = keys.get(_key_bytes(key))
+        if keyset is None:
+            return 0
+        if not isinstance(keyset, set):
+            raise TypeError(WRONGTYPE_MESSAGE)
+        return len(keyset)
+
+    async def mock_delete(key: KeyT) -> int:  # noqa: RUF029
+        _expire_keys()
+        key = _key_bytes(key)
+        Unset = object()
+        expire_times.pop(key, None)
+        if keys.pop(key, Unset) is not Unset:
+            _keyspace_event(key, "del")
+            return 1
+        return 0
+
+    async def mock_getdel(key: KeyT) -> Any:
+        value = await redis_mock.get(key)
+        await redis_mock.delete(key)
+        return value
+
+    async def mock_pexpire(key: KeyT, px: int, xx: bool = False) -> bool:  # noqa: RUF029
+        _expire_keys()
+        key = _key_bytes(key)
+        if key in keys:
+            if not xx or key in expire_times:
+                expire_times[key] = time.monotonic() + (px / 1000)
+                _keyspace_event(key, "expire")
+            return True
+        return False
+
+    class _Pipeline:
+        def __init__(self):
+            self.results = []
+
+        def set(
+            self,
+            key: KeyT,
+            value: EncodableT,
+            ex: int | None = None,
+            px: int | None = None,
+            nx: bool = False,
+        ):
+            self.results.append(
+                redis_mock.set(key=key, value=value, ex=ex, px=px, nx=nx)
+            )
+
+        def get(self, key: KeyT):
+            self.results.append(redis_mock.get(key=key))
+
+        def sadd(self, key: KeyT, value: EncodableT):
+            self.results.append(redis_mock.sadd(key=key, value=value))
+
+        def pexpire(self, key: KeyT, px: int, xx: bool = False):
+            self.results.append(redis_mock.pexpire(key=key, px=px, xx=xx))
+
+        async def execute(self):
+            results = await asyncio.gather(*self.results)
+            self.results = []
+            return results
+
+    def pipeline(transaction: bool = True):
+        return _Pipeline()
+
+    async def mock_eval(script: str, numkeys: int, *keys_and_args: Any) -> Any:
+        """Emulate the scripts the redis state manager runs.
+
+        The fenced save checks the lock held in KEYS[1] against ARGV[1], writes
+        the remaining keys with the expiration in ARGV[2], and returns the
+        lock's PTTL, or None without writing when the lock is not held. The
+        lock release deletes the lock in KEYS[1] only while it holds ARGV[1],
+        and returns the ID that held it. The lock extension sets the lock's
+        expiration to ARGV[2] milliseconds only while it holds ARGV[1], and
+        returns 1 when it did. The contender count returns the size of the set
+        in KEYS[1], less one when ARGV[1] is a member.
+
+        Args:
+            script: The Lua source, which must be one of the state manager's.
+            numkeys: How many leading entries of keys_and_args are keys.
+            keys_and_args: The keys followed by the arguments.
+
+        Returns:
+            The script's reply.
+
+        Raises:
+            NotImplementedError: If the script is not one of the state manager's.
+        """
+        if script == _RELEASE_LOCK_SCRIPT:
+            lock_key, lock_id = keys_and_args
+            owner = await redis_mock.get(lock_key)
+            if owner == lock_id:
+                await redis_mock.delete(lock_key)
+            return owner
+        if script == _EXTEND_LOCK_SCRIPT:
+            lock_key, lock_id, px = keys_and_args
+            if await redis_mock.get(lock_key) != lock_id:
+                return 0
+            return int(await redis_mock.pexpire(lock_key, int(px)))
+        if script == _COUNT_OTHER_CONTENDERS_SCRIPT:
+            waiters_key, instance_id = keys_and_args
+            contenders = await redis_mock.scard(waiters_key)
+            return contenders - (instance_id in keys.get(_key_bytes(waiters_key), ()))
+        if script != _FENCED_SAVE_SCRIPT:
+            msg = "mock_redis only emulates the state manager's scripts."
+            raise NotImplementedError(msg)
+        lock_key, *state_keys = keys_and_args[:numkeys]
+        lock_id, expiration, *payloads = keys_and_args[numkeys:]
+        if await redis_mock.get(lock_key) != lock_id:
+            return None
+        for key, payload in zip(state_keys, payloads, strict=True):
+            await redis_mock.set(key, payload, ex=int(expiration))
+        return await redis_mock.pttl(lock_key)
+
+    async def pttl(key: KeyT) -> int:  # noqa: RUF029
+        _expire_keys()
+        return (
+            int(expire_times.get(_key_bytes(key), time.monotonic()) - time.monotonic())
+            * 1000
+        )
+
+    @contextlib.asynccontextmanager
+    async def pubsub():
+        watch_patterns = {}
+        event_log_pointer = 0
+        # Subscribe confirmations not yet delivered by listen().
+        pending_confirmations: list[dict[str, Any]] = []
+
+        async def psubscribe(  # noqa: RUF029
+            *patterns: str,
+            **handlers: Callable[[dict[str, bytes]], None],
+        ):
+            nonlocal event_log_pointer, watch_patterns
+            event_log_pointer = len(event_log) - 1
+
+            for pattern, handler in (
+                *((pattern, None) for pattern in patterns),
+                *handlers.items(),
+            ):
+                watch_patterns[pattern] = handler
+                pending_confirmations.append({
+                    "type": "psubscribe",
+                    "pattern": None,
+                    "channel": pattern.encode(),
+                    "data": len(watch_patterns),
+                })
+                _event_log_append_notify({
+                    "channel": b"psubscribe",
+                    "data": pattern.encode(),
+                })
+
+        async def listen() -> AsyncGenerator[dict[str, Any], None]:
+            nonlocal event_log_pointer
+            while True:
+                # Like redis-py, deliver subscribe confirmations as messages.
+                while pending_confirmations:
+                    yield pending_confirmations.pop(0)
+                if event_log_pointer >= len(event_log):
+                    await event_log_new_events.wait()
+                    event_log_new_events.clear()
+                    continue
+                event = event_log[event_log_pointer]
+                channel_str = event["channel"].decode()
+                event_log_pointer += 1
+                for pattern, handler in watch_patterns.items():
+                    if fnmatch.fnmatch(channel_str, pattern):
+                        if handler is not None:
+                            res = handler(event)
+                            if asyncio.iscoroutine(res):
+                                await res
+                        else:
+                            yield {
+                                "type": "pmessage",
+                                "pattern": pattern.encode(),
+                                "channel": event["channel"],
+                                "data": event["data"],
+                            }
+
+        pubsub_mock = AsyncMock()
+        pubsub_mock.psubscribe = psubscribe
+        pubsub_mock.listen = listen
+        yield pubsub_mock
+
+    redis_mock = AsyncMock(spec=Redis)
+    redis_mock.get = mock_get
+    redis_mock.mget = mock_mget
+    redis_mock.set = mock_set
+    redis_mock.delete = mock_delete
+    redis_mock.getdel = mock_getdel
+    redis_mock.sadd = mock_sadd
+    redis_mock.srem = mock_srem
+    redis_mock.scard = mock_scard
+    redis_mock.pexpire = mock_pexpire
+    redis_mock.pipeline = pipeline
+    redis_mock.eval = mock_eval
+    redis_mock.pttl = pttl
+    redis_mock.pubsub = pubsub
+    redis_mock.config_set = AsyncMock()
+    redis_mock.get_connection_kwargs = Mock(return_value={"db": 1})
+    redis_mock._internals = {
+        "keys": keys,
+        "expire_times": expire_times,
+        "event_log": event_log,
+        "event_log_on_update": event_log_on_update,
+    }
+    return redis_mock
+
+
+@contextlib.asynccontextmanager
+async def real_redis() -> AsyncGenerator[Redis | None]:
+    """Get a real redis client for testing.
+
+    Yields:
+        The redis client.
+    """
+    redis = prerequisites.get_redis()
+    if redis is None:
+        yield None
+        return
+
+    # Create a pubsub to keep the internal event log for assertions.
+    event_log = []
+    event_log_on_update = asyncio.Event()
+    object.__setattr__(
+        redis,
+        "_internals",
+        {
+            "event_log": event_log,
+            "event_log_on_update": event_log_on_update,
+        },
+    )
+    redis_db = redis.get_connection_kwargs().get("db", 0)
+    pubsub_ready = asyncio.Event()
+
+    async def log_events():
+        async with redis.pubsub() as pubsub:
+            await pubsub.psubscribe(f"__keyspace@{redis_db}__:*")
+            pubsub_ready.set()
+            async for message in pubsub.listen():
+                if message is None:
+                    continue
+                event_log.append(message)
+                event_log_on_update.set()
+
+    log_events_task = asyncio.create_task(log_events())
+    await pubsub_ready.wait()
+    try:
+        yield redis
+    finally:
+        log_events_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await log_events_task

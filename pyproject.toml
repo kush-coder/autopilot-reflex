@@ -1,0 +1,592 @@
+[project]
+name = "reflex"
+dynamic = ["version"]
+description = "Web apps in pure Python."
+license.text = "Apache-2.0"
+authors = [
+  { name = "Nikhil Rao" },
+  { name = "Alek Petuskey" },
+  { name = "Masen Furer" },
+  { name = "Elijah Ahianyo" },
+  { name = "Thomas Brandeho" },
+  { name = "Khaleel Al-Adhami" },
+]
+maintainers = [
+  { name = "Masen Furer" },
+  { name = "Khaleel Al-Adhami" },
+  { email = "maintainers@reflex.dev" },
+]
+readme = "README.md"
+keywords = ["web", "framework"]
+requires-python = ">=3.11,<4.0"
+dependencies = [
+  "click >=8.2",
+  "granian[reload] >=2.7.4",
+  "httpx >=0.26,<1.0",
+  "packaging >=24.2,<27",
+  "psutil >=7.0.0,<8.0; sys_platform == 'win32'",
+  "python-multipart >=0.0.32,<1.0",
+  "python-engineio >=4.12.0,<5.0",
+  "python-socketio >=5.12.0,<6.0",
+  "redis >=6.4,<9.0",
+  "rich >=13,<16",
+  "starlette >=1.3.1",
+  "typing_extensions >=4.13.0",
+  "wrapt >=1.17.0,<2.6",
+  "reflex-base >= 0.11.1.dev0",
+  "reflex-components-code >= 0.11.0",
+  "reflex-components-core >= 0.11.0",
+  "reflex-components-dataeditor >= 0.10.1",
+  "reflex-components-gridjs >= 0.10.0",
+  "reflex-components-lucide >= 1.1.2",
+  "reflex-components-markdown >= 0.10.0",
+  "reflex-components-moment >= 0.10.1",
+  "reflex-components-plotly >= 0.10.0",
+  "reflex-components-radix >= 0.11.0",
+  "reflex-components-react-player >= 0.10.0",
+  "reflex-components-recharts >= 0.10.0",
+  "reflex-components-sonner >= 0.10.0",
+  "reflex-hosting-cli >= 0.2.2",
+]
+
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+]
+
+[project.optional-dependencies]
+db = [
+  # The async SQLite driver, so the default sqlite database URL also works with
+  # SQLAlchemy's async engine and sessions.
+  "aiosqlite >=0.20.0",
+  "alembic >=1.15.2,<2.0",
+  # SQLAlchemy 2.1 made greenlet an optional extra, but reflex.model imports
+  # sqlalchemy.ext.asyncio, which needs it at import time. 3.3 is the first
+  # release with wheels for every supported CPython, Python 3.14 included.
+  "greenlet >=3.3",
+  "pydantic >=2.12.0,<3.0",
+  "sqlmodel >=0.0.24",
+]
+pydantic = ["reflex-base[pydantic]"]
+testing = [
+  "psutil >=7.0.0,<8.0",
+  "selenium >=4.0.0,<5.0",
+  "uvicorn >=0.34.0,<1.0",
+]
+
+[project.urls]
+homepage = "https://reflex.dev"
+repository = "https://github.com/reflex-dev/reflex"
+documentation = "https://reflex.dev/docs/getting-started/introduction"
+
+[project.scripts]
+reflex = "reflex.reflex:cli"
+
+[dependency-groups]
+dev = [
+  "alembic",
+  "asynctest",
+  "codespell",
+  "darglint",
+  "dill",
+  "fastapi",
+  "hatchling",
+  "libsass",
+  "numpy",
+  "opentelemetry-sdk",
+  "pandas",
+  "pillow",
+  "playwright",
+  "plotly",
+  "pre-commit",
+  "psutil",
+  "psycopg[binary]",
+  "pydantic",
+  "pyright",
+  "pytest-asyncio",
+  "pytest-benchmark",
+  "pytest-codspeed",
+  "pytest-cov",
+  "pytest-mock",
+  "pytest-playwright",
+  "pytest-rerunfailures",
+  "pytest-split",
+  "pytest",
+  "python-dotenv",
+  "pyyaml",
+  "reflex-bench",
+  "reflex-docgen",
+  "reflex-otel",
+  "reflex-release",
+  "reflex-build-sdk[aiohttp,httpx,httpx2]",
+  "reflex-site-shared",
+  "reflex-workflow",
+  "ruff",
+  "selenium",
+  "sqlalchemy",
+  "sqlmodel",
+  "toml",
+  "towncrier",
+  "ty",
+  "typer",
+  "uvicorn",
+  "cronsim",
+  "croniter",
+]
+# The benchmark CI jobs: the harness without the dev group (libsass builds from
+# source on arm64), and the playground's own dependencies beyond reflex[db].
+bench = ["reflex-bench", "plotly>=6.0,<7.0"]
+
+
+[build-system]
+requires = ["hatchling", "uv-dynamic-versioning"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.uv-dynamic-versioning]
+fallback-version = "0.0.0dev0"
+bump = true
+
+[tool.hatch.build]
+# Leading slashes anchor to the repo root; unanchored patterns match nested
+# directories under packages/ too.
+include = ["/reflex"]
+# Include uncommitted pyi stubs generated for this package.
+artifacts = ["/reflex/**/*.pyi"]
+# The build hook is only needed to build the wheel from the sdist.
+targets.sdist.include = ["/reflex", "/scripts/hatch_build.py"]
+
+[tool.hatch.build.hooks.custom]
+path = "scripts/hatch_build.py"
+dependencies = ["plotly", "ruff"]
+require-runtime-dependencies = true
+
+[tool.pyright]
+extraPaths = [
+  "packages/reflex-bench/src",
+  "packages/reflex-code/src",
+  "packages/reflex-components/src",
+  "packages/reflex-dataeditor/src",
+  "packages/reflex-gridjs/src",
+  "packages/reflex-lucide/src",
+  "packages/reflex-markdown/src",
+  "packages/reflex-moment/src",
+  "packages/reflex-plotly/src",
+  "packages/reflex-radix/src",
+  "packages/reflex-release/src",
+  "packages/reflex-react-player/src",
+  "packages/reflex-react-router/src",
+  "packages/reflex-recharts/src",
+  "packages/reflex-sonner/src",
+  "packages/reflex-components-internal/src",
+  "packages/reflex-otel/src",
+  "packages/reflex-build-sdk/src",
+  "packages/reflex-site-shared/src",
+  "packages/reflex-workflow/src",
+  # The workflow examples are read from the repository rather than installed.
+  "packages/reflex-workflow",
+  "packages/integrations-docs/src",
+]
+exclude = [
+  ".venv",
+  "**/__pycache__",
+  "**/.*",
+  "**/.templates",
+  "**/node_modules",
+  "docs",
+  "packages/reflex-site-shared",
+  "packages/integrations-docs",
+  "packages/reflex-ui-shared",
+]
+reportIncompatibleMethodOverride = false
+
+[tool.ruff]
+target-version = "py311"
+output-format = "concise"
+extend-exclude = ["tests/units/reflex_base/utils/pyi_generator/golden"]
+lint.isort.split-on-trailing-comma = false
+lint.select = ["ALL"]
+lint.ignore = [
+  "A",
+  "ANN002",
+  "ANN003",
+  "ANN2",
+  "ANN4",
+  "ARG",
+  # Timeouts are explicit parameters of the testing and state-manager APIs.
+  "ASYNC109",
+  # Background event handlers hold `async with self` across `yield` by design.
+  "ASYNC119",
+  "BLE",
+  "C901",
+  "COM",
+  "CPY001",
+  "D205",
+  "DOC202",
+  "DOC501",
+  "DOC502",
+  "DTZ",
+  "E501",
+  "F403",
+  "FBT",
+  "FIX",
+  "FURB189",
+  "FURB140",
+  "G004",
+  "ISC003",
+  "PLC",
+  "PLR",
+  "PLW",
+  "PT011",
+  "PT012",
+  "PYI",
+  "RUF012",
+  "RUF067",
+  # State managers deliberately skip write-back when the `with` body raises.
+  "RUF075",
+  # `noqa` comments stay readable to non-ruff tooling and to older ruff versions.
+  "RUF105",
+  "RUF201",
+  "S",
+  "SLF",
+  "SLOT",
+  "TC",
+  "TD",
+  "TRY0",
+  "TRY400", # User-facing errors deliberately omit tracebacks; debug logs carry diagnostics where appropriate.
+  # `StrEnum` renders members as their value where `(str, Enum)` renders
+  # `Cls.NAME`; these enums rely on the latter in `str()` and f-strings.
+  "UP042",
+]
+lint.pydocstyle.convention = "google"
+lint.flake8-bugbear.extend-immutable-calls = [
+  "reflex_base.utils.types.Unset",
+  "reflex_base.vars.base.Var.create",
+]
+preview = true
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/*.py" = [
+  "ANN001",
+  "D100",
+  "D103",
+  "D104",
+  "INP",
+  "B018",
+  "PERF",
+  "T",
+  "N",
+]
+"benchmarks/*.py" = ["ANN001", "D100", "D103", "D104", "B018", "PERF", "T", "N"]
+# A benchmark is a script: it prints its results and is run, not imported.
+"packages/*/benchmarks/*.py" = ["INP", "PERF", "T", "ASYNC240"]
+"*/.templates/*.py" = ["D100", "D103", "D104"]
+# `alembic init` copies every file of the template directory, so no __init__.py.
+"reflex/.templates/alembic/*.py" = ["INP001"]
+"*.pyi" = ["D301", "D415", "D417", "D418", "E742", "N", "PGH"]
+"pyi_generator.py" = ["N802"]
+"packages/reflex-base/src/reflex_base/constants/*.py" = ["N"]
+# Generated from async generators, which cannot `yield from`.
+"packages/reflex-build-sdk/src/reflex_build_sdk/_sync/**/*.py" = ["UP028"]
+"packages/reflex-hosting-cli/src/reflex_cli/**/*.py" = [
+  "B008",
+  "D420",
+  "EM101",
+  "EM102",
+  "RET504",
+]
+"tests/units/reflex_cli/**/*.py" = ["DOC201", "PT006", "RUF052"]
+# Generated from async comprehensions, which have no list() equivalent.
+"tests/units/reflex_build_sdk/_sync/**/*.py" = ["C416"]
+"*/.templates/apps/blank/code/*" = ["INP001"]
+"*/blank.py" = ["I001"]
+"docs/package/scripts/*.py" = ["INP001"]
+"packages/reflex-build-sdk/scripts/*.py" = ["INP001", "T201"]
+"packages/reflex-base/hatch_build.py" = ["INP001"]
+"scripts/changed_paths.py" = ["T201"]
+"scripts/check_min_deps.py" = ["T201"]
+"scripts/check_outdated_deps.py" = ["T201"]
+"scripts/hash_examples.py" = ["T201"]
+"scripts/verify_pyi.py" = ["T201"]
+# Skill helper scripts are CLIs whose whole job is printing a report.
+".claude/skills/*/scripts/*.py" = ["T201"]
+
+[tool.pytest.ini_options]
+filterwarnings = "ignore:fields may not start with an underscore:RuntimeWarning"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_mode = "auto"
+markers = [
+  "performance: scheduled wall-time, service, memory, lifecycle, or browser benchmark",
+]
+
+[tool.codespell]
+skip = "*.html, examples, *.pyi, */nba.csv, */olympic-winners.json, packages/reflex-build-sdk/openapi.json, uv.lock, */bun.lock, */package-lock.json, node_modules"
+ignore-words-list = "te, TreeE, selectin"
+
+
+[tool.coverage.run]
+source = [
+  "reflex",
+  "reflex_components_code",
+  "reflex_components_core",
+  "reflex_components_dataeditor",
+  "reflex_components_gridjs",
+  "reflex_components_lucide",
+  "reflex_components_markdown",
+  "reflex_components_moment",
+  "reflex_components_plotly",
+  "reflex_components_radix",
+  "reflex_components_react_player",
+  "reflex_components_recharts",
+  "reflex_components_sonner",
+  "reflex_base",
+  "reflex_docgen",
+  "reflex_otel",
+  "reflex_release",
+  "reflex_build_sdk",
+  "reflex_site_shared",
+  "reflex_components_internal",
+  "reflex_integrations_docs",
+  # Not reflex_bench: CI skips most of its tests on pull requests that leave it
+  # alone, so measuring it would make the total depend on whether one touched it.
+  "reflex_workflow",
+]
+branch = true
+omit = [
+  "*/pyi_generator.py",
+  "reflex/__main__.py",
+  "reflex/app_module_for_backend.py",
+  "reflex/components/chakra/*",
+  "reflex/experimental/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+# TODO bump back to 79
+fail_under = 72
+precision = 2
+ignore_errors = true
+
+exclude_also = [
+  "def __repr__",
+  # Don't complain about missing debug-only code:
+  "if self.debug",
+  # Don't complain if tests don't hit defensive assertion code:
+  "raise AssertionError",
+  "raise NotImplementedError",
+  # Regexes for lines to exclude from consideration
+  "if 0:",
+  # Don't complain if non-runnable code isn't run:
+  "if __name__ == .__main__.:",
+  # Don't complain about abstract methods, they aren't run:
+  "@(abc.)?abstractmethod",
+  # Don't complain about overloaded methods:
+  "@overload",
+]
+
+[tool.coverage.html]
+directory = "coverage_html_report"
+
+[tool.reflex-release]
+# The release path runs the reflex-release bundled in this repository, resolved
+# from uv.lock, rather than a version published to PyPI. That pins the whole
+# pipeline to one commit: the workflows below are generated from the templates
+# in packages/reflex-release, and the sync --check on every pull request
+# compares them against the templates of that same commit. A workflow edited by
+# hand and a template updated without regenerating are both drift, and both
+# fail the same check.
+cli-command = "uv run --frozen --package reflex-release reflex-release"
+root-package = "reflex"
+root-source-dirs = ["reflex"]
+packages-dir = "packages"
+package-source-subdirs = ["src"]
+# reflex-base embeds the frontend javascript package as its web template.
+extra-source-dirs = { reflex-base = ["packages/reflex-frontend/src"] }
+# Changelog dates and r/pre-<date> branch names are stamped in the project's
+# home timezone, so an evening release is not dated tomorrow by a UTC runner.
+release-timezone = "America/Los_Angeles"
+# No changelog, no news fragments: patch-released on every push to main that
+# touches them.
+internal-packages = ["reflex-components-internal", "reflex-site-shared"]
+# Built for the docs site (integrations-docs) or used only inside this repository
+# (reflex-bench) rather than published to PyPI: no release checkbox, no
+# changelog detection, no news fragment, and publish refuses it.
+never-publish-packages = ["integrations-docs", "reflex-bench"]
+
+# reflex pins reflex-base exactly and publishes after it, reusing a base tag at
+# its own version when one exists. reflex-base releases on its own.
+[[tool.reflex-release.lockstep]]
+members = ["reflex", "reflex-base"]
+publish-last = ["reflex"]
+pin-exact = true
+
+[tool.towncrier]
+# Shared monorepo config. package/name intentionally empty — each invocation
+# passes --dir <package_path> --name <package> --version <vX.Y.Z> to target a
+# specific package. See https://towncrier.readthedocs.io/en/stable/monorepo.html
+package = ""
+name = ""
+directory = "news"
+filename = "CHANGELOG.md"
+title_format = "## {version} ({project_date})"
+issue_format = "[#{issue}](https://github.com/reflex-dev/reflex/issues/{issue})"
+start_string = "<!-- towncrier release notes start -->\n"
+# towncrier's template appends the issue links to the last line of an entry,
+# inside a trailing code fence; this one puts them above the block.
+template = "reflex_release:changelog.md"
+
+[[tool.towncrier.type]]
+directory = "breaking"
+name = "Breaking Changes"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "deprecation"
+name = "Deprecations"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "feature"
+name = "Features"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "bugfix"
+name = "Bug Fixes"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "performance"
+name = "Performance"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "docs"
+name = "Documentation"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "misc"
+name = "Miscellaneous"
+showcontent = true
+
+# Packages that must not be reported by scripts/check_outdated_deps.py. An entry matches by
+# exact name, or by prefix when it ends in `*`.
+#
+# `*_held` is for packages blocked on work we own: the script errors if one is already at its
+# latest version, since that means the blocker is gone and the entry should be deleted.
+# `*_pinned` is for packages we do not drive -- pinned by policy or owned by another repo --
+# where reaching latest says nothing about whether the entry can go, so staleness is not
+# checked.
+[tool.check-outdated-deps]
+backend_held = [
+    # plotly.py 7 targets plotly.js 4, which is held below in `frontend_held` (#7002);
+    # figures built with it would render against the older plotly.js bundle.
+    "plotly",
+]
+backend_pinned = [
+    # Linters are pinned deliberately and bumped on their own cadence.
+    "pyright",
+    "ruff",
+]
+frontend_held = [
+    # 18.x removes the bundled MIME fallback table; 19.x partially accepts batches
+    # over max_files instead of rejecting them. Preserve rx.upload behavior until
+    # these changes have a compatibility path.
+    "react-dropzone",
+    # Held at 4.3.0: 4.3.1+ reworked source-file scanning (tailwindlabs/tailwindcss#20214)
+    # and walks the git-ignored `.web` tree, which collapses the docs prod build at scale.
+    # See the note on `Constants.VERSION` in reflex_base/plugins/tailwind_v4.py and #7022.
+    "tailwindcss",
+    "@tailwindcss/postcss",
+]
+frontend_pinned = [
+    # Pinned in other repos (reflex-enterprise and friends), so their versions are not
+    # ours to advance.
+    "@chakra-ui/*",
+    "lucide-react",
+    "@splinetool/runtime",
+    "framer-motion",
+    # ag-grid-community, -enterprise and -react release in lockstep; the shell filter
+    # needed both `ag-grid` and `ag-grid-react` to cover them.
+    "ag-grid*",
+]
+
+[tool.uv]
+# 0.11.8 is the first release that resolves a URL dependency reached through a
+# URL build requirement. reflex's build hook sets require-runtime-dependencies,
+# so every workspace package it depends on is a file:// build requirement, and
+# reflex-hosting-cli reaches reflex-build-sdk the same way. Older uv refuses the
+# second hop and `uv sync` cannot build reflex at all.
+required-version = ">=0.11.8"
+exclude-newer = "7 days"
+
+# Internal Reflex packages release in lockstep and are routinely pinned (>=) at a version
+# published within the exclude-newer window; disable the floor for them so resolution
+# always sees their latest release. The floor still applies to third-party dependencies.
+# Add any new internal package that is published and pinned as a (build or runtime)
+# dependency here.
+[tool.uv.exclude-newer-package]
+hatch-reflex-pyi = false
+reflex = false
+reflex-base = false
+reflex-build-sdk = false
+reflex-components-code = false
+reflex-components-core = false
+reflex-components-dataeditor = false
+reflex-components-gridjs = false
+reflex-components-internal = false
+reflex-components-lucide = false
+reflex-components-markdown = false
+reflex-components-moment = false
+reflex-components-plotly = false
+reflex-components-radix = false
+reflex-components-react-player = false
+reflex-components-recharts = false
+reflex-components-sonner = false
+reflex-enterprise = false
+reflex-hosting-cli = false
+pillow = "2026-10-21T00:00:00Z"
+certifi = "2026-10-21T00:00:00Z"
+virtualenv = "2026-10-23T00:00:00Z"
+
+[tool.uv.sources]
+hatch-reflex-pyi.workspace = true
+reflex-base.workspace = true
+reflex-bench.workspace = true
+reflex-components-code.workspace = true
+reflex-components-core.workspace = true
+reflex-components-dataeditor.workspace = true
+reflex-components-gridjs.workspace = true
+reflex-components-lucide.workspace = true
+reflex-components-markdown.workspace = true
+reflex-components-moment.workspace = true
+reflex-components-plotly.workspace = true
+reflex-components-radix.workspace = true
+reflex-components-react-player.workspace = true
+reflex-components-recharts.workspace = true
+reflex-components-sonner.workspace = true
+reflex-docgen.workspace = true
+reflex-release.workspace = true
+reflex-hosting-cli.workspace = true
+reflex-otel.workspace = true
+reflex-build-sdk.workspace = true
+reflex-components-internal.workspace = true
+reflex-site-shared.workspace = true
+reflex-workflow.workspace = true
+reflex-integrations-docs.workspace = true
+reflex.workspace = true
+
+[tool.uv.workspace]
+members = ["packages/*", "docs/app", "docs/package"]
+# A javascript package: reflex-base embeds it, and nothing installs it with uv.
+exclude = ["packages/reflex-frontend"]

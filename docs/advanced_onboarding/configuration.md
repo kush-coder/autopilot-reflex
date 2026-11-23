@@ -1,0 +1,233 @@
+
+# Configuration
+
+Reflex apps can be configured using a configuration file, environment variables, and command line arguments.
+
+## Configuration File
+
+Running `uv run reflex init` will create an `rxconfig.py` file in your root directory.
+You can pass keyword arguments to the `Config` class to configure your app.
+
+For example:
+
+```python
+# rxconfig.py
+import reflex as rx
+
+config = rx.Config(
+    app_name="my_app_name",
+    # Connect to your own database.
+    db_url="postgresql://user:password@localhost:5432/my_db",
+    # Change the frontend port.
+    frontend_port=3001,
+)
+```
+
+See the [config reference](/docs/api-reference/config/) for all the parameters available.
+
+## Event Loop Blocking Detection
+
+In development, Reflex warns when an event handler blocks the asyncio event loop near or beyond `event_loop_blocking_threshold` seconds (default `0.2`). The warning appears as soon as the threshold is reached, so a handler that never returns is reported too. It names the handler and the innermost line of your app's code in the blocking stack, then shows the stack as it was when the threshold was reached, which is one sample and not necessarily the slowest part. It recommends moving blocking I/O to a thread pool or using a non-blocking async API. When the loop responds again, a second line reports the total duration, which includes the state updates after the handler, such as computed vars.
+
+Some blocking is reported differently:
+
+- **First import of a module.** The warning names the module that the import statement imports and the line of your app that imports it, and leaves Python's import machinery out of the stack. It suggests importing the module at the top of a module, or loading it in a thread first from an async handler.
+- **Task with no event.** A task that processes no event, such as a task your app starts, is reported by its task name.
+- **Handler from an installed package.** A handler from an installed package, with none of your app's code in the blocking stack, is reported once per process. The warning names the package and shows the stack from the handler on.
+
+Background events still run on the event loop and do not make synchronous blocking code non-blocking. Detection is always off in production. Set the threshold to `0` to turn it off in development:
+
+```python
+config = rx.Config(
+    app_name="my_app_name",
+    event_loop_blocking_threshold=0,
+)
+```
+
+The setting can also be overridden with `REFLEX_EVENT_LOOP_BLOCKING_THRESHOLD`, for example `REFLEX_EVENT_LOOP_BLOCKING_THRESHOLD=0` to turn detection off.
+
+## Environment Variables
+
+Any config parameter can be overridden by setting an environment variable with the `REFLEX_` prefix and the parameter name in uppercase. Environment variables take precedence over values set in `rxconfig.py`.
+
+For example, to override the `frontend_port` setting:
+
+```bash
+REFLEX_FRONTEND_PORT=3001 uv run reflex run
+```
+
+The [config reference](/docs/api-reference/config/) lists the environment variable corresponding to each config parameter. Reflex also honors additional environment variables that are not config parameters — see [environment variables](/docs/api-reference/environment-variables/) for those.
+
+## Command Line Arguments
+
+Finally, you can override the configuration file and environment variables by passing command line arguments to `uv run reflex run`.
+
+```bash
+uv run reflex run --frontend-port 3001
+```
+
+See the [CLI reference](/docs/api-reference/cli/) for all the arguments available.
+
+## Loading a .env File
+
+Set `env_file` (or the `REFLEX_ENV_FILE` environment variable) to load environment variables from a dotenv-format file before the config is read. This requires the `python-dotenv` package to be installed.
+
+```python
+config = rx.Config(
+    app_name="my_app_name",
+    env_file=".env",
+)
+```
+
+Multiple files can be passed separated by `os.pathsep` (`:` on Linux/macOS, `;` on Windows); when several files set the same variable, the first file in the list takes precedence. Values from an env file override variables already present in the environment.
+
+Because the env file is loaded before config overrides are applied, it can set any `REFLEX_*` variable, e.g. `REFLEX_FRONTEND_PORT=3001`.
+
+## The App Module
+
+`app_name` tells Reflex where your app lives: by default it imports the module `<app_name>.<app_name>` (the layout created by `reflex init`) and expects it to define a module-level variable named `app`, an instance of `rx.App`.
+
+Set `app_module_import` to load the app from a different module, e.g. a `src` layout or a package entry point:
+
+```python
+config = rx.Config(
+    app_name="my_app_name",
+    # Equivalent to `from mypkg.main import app`.
+    app_module_import="mypkg.main",
+)
+```
+
+The imported module must still define `app` at module level.
+
+## Ports, Hosts and URLs
+
+- `frontend_port` (default `3000`) and `backend_port` (default `8000`) control which ports the frontend and backend listen on. In dev mode, if a port is taken, the next available port is used.
+- `backend_host` (default `0.0.0.0`) is the address the backend server binds to.
+- `api_url` (default `http://localhost:8000`) is the URL the user's **browser** uses to reach the backend. You typically don't need to set it: when `api_url` points at localhost, the frontend substitutes the domain the app was served from, so a backend reachable at the same address as the frontend (e.g. behind a reverse proxy or load balancer) is found automatically. Set `api_url` only when the backend is listening on a different address than the frontend, e.g. `https://api.example.com`.
+- `deploy_url` (unset by default) is the public URL where the **frontend** is hosted when it is served from a different origin than the backend. Reflex uses it wherever an absolute frontend URL is needed — most notably for the links in the generated `sitemap.xml`, which fall back to `http://localhost:<frontend_port>` when it is unset (`config.frontend_url` exposes that resolved value). It is also the origin browsers will present when connecting to the backend, which matters for CORS (below).
+
+## CORS
+
+For HTTP endpoints, the backend only accepts cross-origin requests from origins listed in `cors_allowed_origins`. By default any origin is allowed in dev mode. In prod mode the backend serves the frontend from its own origin, so by default it sends no CORS headers (same-origin requests need none) unless `deploy_url` is set, in which case that origin is allowed.
+
+The WebSocket connection follows the same settings, but because the backend must recognize its own origin itself, it checks WebSocket handshakes separately. In prod mode, unless `cors_allowed_origins` is set explicitly, it accepts the host named by the request's `Host` header, over http or https, plus the origin of `deploy_url` when set; a TLS-terminating proxy that keeps `Host` needs no further configuration. `X-Forwarded-Host` and `X-Forwarded-Proto` are honored only when [`trusted_proxy_hops`](#client-ip-behind-proxies) is set; a trusted `X-Forwarded-Proto: https` then also rejects pages served over plain http. A frontend served from a different origin than the backend therefore needs `REFLEX_DEPLOY_URL` set on the **backend** to the frontend's public URL, scheme included (e.g. `REFLEX_DEPLOY_URL=https://app.example.com`). So does a reverse proxy that rewrites `Host`, unless it sends the original host as `X-Forwarded-Host` and `trusted_proxy_hops` is set (e.g. Azure Front Door). The first time a worker refuses a WebSocket connection, it logs a warning naming the rejected origin.
+
+Set `cors_allowed_origins` explicitly when the frontend is reachable from several origins, or to `["*"]` to allow any origin in production:
+
+```python
+config = rx.Config(
+    app_name="my_app_name",
+    api_url="https://api.example.com",
+    deploy_url="https://example.com",
+    cors_allowed_origins=["https://example.com"],
+)
+```
+
+The setting applies to both regular HTTP endpoints and the WebSocket connection. As an environment variable, pass a comma-separated list:
+
+```bash
+REFLEX_CORS_ALLOWED_ORIGINS="https://example.com,https://www.example.com" uv run reflex run
+```
+
+## Path Prefixes
+
+By default the frontend is served from the root of its domain and backend routes are mounted at the root of the backend server. Two settings change that, e.g. when the app shares a domain with other services behind a reverse proxy:
+
+- `frontend_path` serves the frontend under a sub-path: `frontend_path="/app"` serves the frontend at `http://localhost:3000/app`.
+- `backend_path` mounts all backend routes under a prefix: `backend_path="/api"` mounts the event WebSocket and the `/ping`, `/_upload`, `/_health`, and `/_all_routes` endpoints under `/api`. The prefix is automatically included in the backend URLs baked into the frontend. Routes are registered at startup, so changing it requires a full `reflex run` restart.
+
+Both values are normalized to start with a `/`.
+
+When `frontend_path` is set, use `rx.asset()` for local files in the `assets/` directory. It adds the configured frontend path to the generated URL. Literal paths such as `src="/components/logo.svg"` are not rewritten, so they must already include the prefix (for example, `src="/app/components/logo.svg"`).
+
+## Client IP Behind Proxies
+
+`router.session.client_ip` uses the connection's peer address by default and ignores `X-Forwarded-For`, which an untrusted client can set. If the backend is reachable only through trusted reverse proxies that append their observed client address to `X-Forwarded-For`, set `trusted_proxy_hops` to the number of those proxies:
+
+```python
+config = rx.Config(
+    app_name="my_app_name",
+    trusted_proxy_hops=1,
+)
+```
+
+For example, `trusted_proxy_hops=1` uses the rightmost `X-Forwarded-For` entry; `2` uses the second entry from the right. The entry is normalized to an IP address after dropping any port and IPv6 brackets, and an IPv4-mapped IPv6 address such as `::ffff:203.0.113.7` becomes its IPv4 address; if it is not a valid address, it is ignored and the connection's peer address is used. The same entry of `X-Forwarded-Host` and `X-Forwarded-Proto` is used when the backend checks the origin of a WebSocket connection (see [CORS](#cors)). Proxies usually set these two headers instead of appending to them, so when one has fewer entries than `trusted_proxy_hops`, its leftmost entry is used. The default is `0`. Do not enable forwarded-header trust if untrusted clients can connect directly to the backend or bypass the trusted proxy chain. The setting can also be provided as `REFLEX_TRUSTED_PROXY_HOPS`.
+
+## Plugins
+
+Plugins extend the Reflex compiler. Add plugin instances via the `plugins` parameter, and disable plugins that are enabled by default (like the sitemap plugin) with `disable_plugins`:
+
+```python
+config = rx.Config(
+    app_name="my_app_name",
+    plugins=[
+        rx.plugins.SitemapPlugin(),
+        rx.plugins.TailwindV4Plugin(),
+    ],
+    # Or turn off a default-enabled plugin:
+    # disable_plugins=[rx.plugins.SitemapPlugin],
+)
+```
+
+Plugins can also be specified in the environment as fully qualified import paths, separated by `:`. Plugins specified this way are instantiated without arguments, so plugins that require constructor arguments must be configured in `rxconfig.py`.
+
+- `REFLEX_PLUGINS` **replaces** the `plugins` list from `rxconfig.py`.
+- `REFLEX_EXTRA_PLUGINS` **appends** to the configured plugins, skipping any that are already configured or disabled.
+- `REFLEX_DISABLE_PLUGINS` lists plugin classes to disable.
+
+```bash
+REFLEX_EXTRA_PLUGINS="reflex.plugins.SitemapPlugin" uv run reflex run
+```
+
+See the [plugins reference](/docs/api-reference/plugins/) for the available plugins and how to write your own.
+
+## React Compiler (Experimental)
+
+React Compiler adds automatic memoization to generated React components. It is disabled by default. To try it, set `react_compiler=True` in `rxconfig.py`:
+
+```python
+config = rx.Config(
+    app_name="my_app_name",
+    react_compiler=True,
+)
+```
+
+Or enable it with an environment variable:
+
+```bash
+REFLEX_REACT_COMPILER=true uv run reflex run
+```
+
+This option targets Reflex's supported React 19 runtime and runs in both development and production. It compiles generated JavaScript and JSX in `app/`, `app_components/`, and `utils/components/`. Other runtime utilities and installed dependencies are excluded. Existing Reflex memoization remains enabled.
+
+The compiler adds build time and memory overhead. Runtime performance depends on the workload: it can avoid repeated calculations during unrelated state updates, but list-heavy updates can become slower. Measure your application's interactions before enabling it in production.
+
+Restart `reflex run` after changing the flag, and rebuild production output. Disabling the flag removes the compiler transform and its optional build dependencies on the next frontend install, unless another component or plugin requires those dependencies.
+
+### Letting React Compiler replace auto-memoization
+
+By default, Reflex wraps each stateful component in a generated memo component. With `react_compiler=True`, you can turn this off and let React Compiler memoize whole pages instead:
+
+```python
+config = rx.Config(
+    app_name="my_app_name",
+    react_compiler=True,
+    auto_memoize=False,
+)
+```
+
+This also shortens Python compilation. React Compiler skips any component it cannot prove safe, such as a custom component whose hook code modifies values during render. Without auto-memoization, a skipped page re-renders completely on every state change, so measure your pages before turning `auto_memoize` off.
+
+Setting both `auto_memoize=False` and `react_compiler=False` logs a warning because page memoization is disabled. Enable one of these options for normal use.
+
+## Customizable App Data Directory
+
+The `REFLEX_DIR` environment variable can be set, which allows users to set the location where Reflex writes helper tools like Bun and NodeJS.
+
+By default we use Platform specific directories:
+
+On windows, `C:/Users/<username>/AppData/Local/reflex` is used.
+
+On macOS, `~/Library/Application Support/reflex` is used.
+
+On linux, `~/.local/share/reflex` is used.
